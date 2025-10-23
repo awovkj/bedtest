@@ -7,6 +7,7 @@ import { handleChunkMerge, checkMergeStatus } from "./chunkMerge";
 import { TelegramAPI } from "../utils/telegramAPI";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getDatabase } from '../utils/databaseAdapter.js';
+import { TELEGRAM_CHUNK_SIZE } from './constants';
 
 
 export async function onRequest(context) {  // Contents of context object
@@ -393,12 +394,12 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
 
     const telegramAPI = new TelegramAPI(tgBotToken);
     
-    // 45MB 分片阈值
-    const CHUNK_SIZE = 45 * 1024 * 1024; // 45MB
+    // 使用统一常量的分片阈值
+    const CHUNK_SIZE = TELEGRAM_CHUNK_SIZE; // 45MB
     
     if (fileSize > CHUNK_SIZE) {
         // 大文件分片上传
-        return await uploadLargeFileToTelegram(env, file, fullId, metadata, fileName, fileType, url, returnLink, tgBotToken, tgChatId, tgChannel);
+        return await uploadLargeFileToTelegram(context, file, fullId, metadata, fileName, fileType, returnLink, tgBotToken, tgChatId, tgChannel);
     }
 
     // 由于TG会把gif后缀的文件转为视频，所以需要修改后缀名绕过限制

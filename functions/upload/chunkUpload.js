@@ -3,6 +3,7 @@ import { createResponse, selectConsistentChannel, getUploadIp, getIPAddress, bui
 import { TelegramAPI } from '../utils/telegramAPI';
 import { S3Client, CreateMultipartUploadCommand, UploadPartCommand, AbortMultipartUploadCommand } from "@aws-sdk/client-s3";
 import { getDatabase } from '../utils/databaseAdapter.js';
+import { TELEGRAM_CHUNK_SIZE } from './constants';
 
 // 初始化分块上传
 export async function initializeChunkedUpload(context) {
@@ -57,11 +58,12 @@ export async function initializeChunkedUpload(context) {
             success: true,
             uploadId,
             message: 'Chunked upload initialized successfully',
+            chunkSize: TELEGRAM_CHUNK_SIZE,
             sessionInfo: {
                 uploadId,
                 originalFileName,
                 totalChunks,
-                uploadChannel
+                uploadChannel,
             }
         }), {
             status: 200,
@@ -204,7 +206,7 @@ async function uploadChunkToStorageWithTimeout(context, chunkIndex, totalChunks,
             setTimeout(() => reject(new Error('Upload timeout')), UPLOAD_TIMEOUT);
         });
         
-        // 执行实际上传
+        // 执行actually upload
         const uploadPromise = uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel);
 
         // 竞速执行
@@ -1020,60 +1022,58 @@ export async function uploadLargeFileToTelegram(context, file, fullId, metadata,
     const { env, waitUntil } = context;
     const db = getDatabase(env);
 
-    const CHUNK_SIZE = 45 * 1024 * 1024; // 45MB
+    // 使用统一常量定义分片大小
+    const CHUNK_SIZE = TELEGRAM_CHUNK_SIZE; // 45MB
     const fileSize = file.size;
     const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
-    
-    // 为了避免CPU超时，限制最大分片数（考虑Cloudflare Worker的CPU时间限制）
-    // 移除 1GB 限制，允许更多分片
-    
+
     const chunks = [];
     const uploadedChunks = [];
-    
+
     try {
         // 分片上传，每5个分片做一次微小延迟以避免CPU超时
         for (let i = 0; i < totalChunks; i++) {
             const start = i * CHUNK_SIZE;
             const end = Math.min(start + CHUNK_SIZE, fileSize);
             const chunkBlob = file.slice(start, end);
-            
+
             // 生成分片文件名
             const chunkFileName = `${fileName}.part${i.toString().padStart(3, '0')}`;
-            
+
             // 上传分片（带重试机制）
             const chunkInfo = await uploadChunkToTelegramWithRetry(
-                tgBotToken, 
-                tgChatId, 
-                chunkBlob, 
-                chunkFileName, 
-                i, 
+                tgBotToken,
+                tgChatId,
+                chunkBlob,
+                chunkFileName,
+                i,
                 totalChunks
             );
-            
+
             if (!chunkInfo) {
                 throw new Error(`Failed to upload chunk ${i + 1}/${totalChunks} after retries`);
             }
-            
+
             // 验证分片信息完整性
             if (!chunkInfo.file_id || !chunkInfo.file_size) {
                 throw new Error(`Invalid chunk info for chunk ${i + 1}/${totalChunks}`);
             }
-            
+
             chunks.push({
                 index: i,
                 fileId: chunkInfo.file_id,
                 size: chunkInfo.file_size,
                 fileName: chunkFileName
             });
-            
+
             uploadedChunks.push(chunkInfo.file_id);
-            
+
             // 每5个分片检查一下，添加微小延迟避免CPU限制
             if (i > 0 && i % 5 === 0) {
                 await new Promise(resolve => setTimeout(resolve, 50)); // 50ms延迟
             }
         }
-        
+
         // 所有分片上传成功，更新metadata
         metadata.Channel = "TelegramNew";
         metadata.ChannelName = tgChannel.name;
@@ -1083,15 +1083,14 @@ export async function uploadLargeFileToTelegram(context, file, fullId, metadata,
         metadata.TotalChunks = totalChunks;
         metadata.FileSize = (fileSize / 1024 / 1024).toFixed(2);
 
-        
         // 将分片信息存储到value中
         const chunksData = JSON.stringify(chunks);
-        
+
         // 验证分片完整性
         if (chunks.length !== totalChunks) {
             throw new Error(`Chunk count mismatch: expected ${totalChunks}, got ${chunks.length}`);
         }
-        
+
         // 写入最终的数据库记录，分片信息作为value
         await db.put(fullId, chunksData, { metadata });
 
@@ -1102,12 +1101,12 @@ export async function uploadLargeFileToTelegram(context, file, fullId, metadata,
             JSON.stringify([{ 'src': returnLink }]),
             {
                 status: 200,
-                headers: { 
+                headers: {
                     'Content-Type': 'application/json',
                 }
             }
         );
-        
+
     } catch (error) {
         return createResponse(`Telegram Channel Error: Large file upload failed - ${error.message}`, { status: 500 });
     }
