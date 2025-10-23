@@ -48,6 +48,37 @@ export class TelegramAPI {
     }
 
     /**
+     * 通过URL发送文件到Telegram（Telegram服务端主动抓取）
+     * @param {string} fileUrl - 文件的可公开访问URL
+     * @param {string} chatId - 聊天ID
+     * @param {string} functionName - API方法名（如：sendDocument）
+     * @param {string} paramName - 文件参数名（如：document）
+     * @param {string} caption - 文件说明
+     * @returns {Promise<Object>} API响应结果
+     */
+    async sendFileByUrl(fileUrl, chatId, functionName = 'sendDocument', paramName = 'document', caption = '') {
+        const formData = new FormData();
+        formData.append('chat_id', chatId);
+        formData.append(paramName, fileUrl);
+        if (caption) {
+            formData.append('caption', caption);
+        }
+
+        const response = await fetch(`${this.baseURL}/${functionName}`, {
+            method: 'POST',
+            headers: this.defaultHeaders,
+            body: formData
+        });
+
+        if (!response.ok) {
+            throw new Error(`Telegram API error: ${response.statusText}`);
+        }
+
+        const responseData = await response.json();
+        return responseData;
+    }
+
+    /**
      * 获取文件信息
      * @param {Object} responseData - Telegram API响应数据
      * @returns {Object|null} 文件信息对象或null

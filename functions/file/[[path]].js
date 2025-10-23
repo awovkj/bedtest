@@ -223,68 +223,95 @@ async function handleTelegramChunkedFile(context, imgRecord, encodedFileName, fi
         const stream = new ReadableStream({
             async start(controller) {
                 try {
+                    // 并发预取窗口，减少顺序等待导致的速度递减
+                    const PREFETCH_WINDOW = 3;
+
+                    // 计算起始分片索引与当前位置
                     let currentPosition = 0;
-                    
+                    let startIndex = 0;
                     for (let i = 0; i < chunks.length; i++) {
-                        const chunk = chunks[i];
-                        const chunkSize = chunk.size || 0;
-                        
-                        // 如果当前分片完全在请求范围之前，跳过
-                        if (currentPosition + chunkSize <= rangeStart) {
-                            currentPosition += chunkSize;
-                            continue;
-                        }
-                        
-                        // 如果当前分片完全在请求范围之后，结束
-                        if (currentPosition > rangeEnd) {
+                        const sz = chunks[i].size || 0;
+                        if (currentPosition + sz > rangeStart) {
+                            startIndex = i;
                             break;
                         }
-                        
-                        // 获取分片数据
-                        const chunkData = await fetchTelegramChunkWithRetry(TgBotToken, chunk, 3);
+                        currentPosition += sz;
+                    }
+
+                    // 维护预取的 Promise 队列
+                    const prefetched = new Map();
+                    function launchPrefetch(idx) {
+                        if (idx >= chunks.length || prefetched.has(idx)) return;
+                        const promise = fetchTelegramChunkWithRetry(TgBotToken, chunks[idx], 3);
+                        prefetched.set(idx, promise);
+                    }
+
+                    // 预热窗口
+                    for (let p = startIndex; p < Math.min(chunks.length, startIndex + PREFETCH_WINDOW); p++) {
+                        launchPrefetch(p);
+                    }
+
+                    // 流式输出，边读边预取
+                    let pos = currentPosition;
+                    for (let i = startIndex; i < chunks.length && pos <= rangeEnd; i++) {
+                        const chunk = chunks[i];
+                        const chunkSize = chunk.size || 0;
+
+                        // 如果当前分片完全在请求范围之前，跳过（安全防护）
+                        if (pos + chunkSize <= rangeStart) {
+                            pos += chunkSize;
+                            continue;
+                        }
+                        // 如果已超出请求范围，结束
+                        if (pos > rangeEnd) {
+                            break;
+                        }
+
+                        // 取出已预取或实时拉取的数据
+                        const pref = prefetched.get(i);
+                        const chunkData = pref ? await pref : await fetchTelegramChunkWithRetry(TgBotToken, chunk, 3);
                         if (!chunkData) {
                             throw new Error(`Failed to fetch chunk ${chunk.index} after retries`);
                         }
-                        
+
                         // 计算在当前分片中的起始和结束位置
-                        const chunkStart = Math.max(0, rangeStart - currentPosition);
-                        const chunkEnd = Math.min(chunkSize, rangeEnd - currentPosition + 1);
-                        
-                        // 如果需要部分分片数据
+                        const chunkStart = Math.max(0, rangeStart - pos);
+                        const chunkEnd = Math.min(chunkSize, rangeEnd - pos + 1);
+
+                        // 部分分片数据或整片数据入队
                         if (chunkStart > 0 || chunkEnd < chunkSize) {
-                            const partialData = chunkData.slice(chunkStart, chunkEnd);
-                            controller.enqueue(partialData);
+                            controller.enqueue(chunkData.slice(chunkStart, chunkEnd));
                         } else {
                             controller.enqueue(chunkData);
                         }
-                        
-                        currentPosition += chunkSize;
+
+                        pos += chunkSize;
+                        // 推进预取窗口
+                        launchPrefetch(i + PREFETCH_WINDOW);
                     }
-                    
+
                     controller.close();
                 } catch (error) {
                     controller.error(error);
                 }
             }
         });
-        
+
         // 设置Range相关头部
         if (isRangeRequest) {
             setRangeHeaders(headers, rangeStart, rangeEnd, totalSize);
-            
             return new Response(stream, {
                 status: 206, // Partial Content
                 headers,
             });
         } else {
             headers.set('Cache-Control', 'private, max-age=86400'); // CDN 不缓存完整文件，避免 CDN 不支持 Range 请求
-            
             return new Response(stream, {
                 status: 200,
                 headers,
             });
         }
-        
+
     } catch (error) {
         return new Response(`Error: Failed to reconstruct chunked file - ${error.message}`, { status: 500 });
     }

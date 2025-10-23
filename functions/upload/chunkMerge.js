@@ -3,6 +3,7 @@ import { createResponse, getUploadIp, getIPAddress, selectConsistentChannel, bui
 import { retryFailedChunks, cleanupFailedMultipartUploads, checkChunkUploadStatuses, cleanupChunkData, cleanupUploadSession } from './chunkUpload';
 import { S3Client, CompleteMultipartUploadCommand } from "@aws-sdk/client-s3";
 import { getDatabase } from '../utils/databaseAdapter.js';
+import { TelegramAPI } from '../utils/telegramAPI';
 
 // 处理分块合并
 export async function handleChunkMerge(context) {
@@ -578,7 +579,7 @@ async function mergeTelegramChunksInfo(context, uploadId, completedChunks, metad
         // 生成 finalFileId
         const finalFileId = await buildUniqueFileId(context, metadata.FileName, metadata.FileType);
 
-        // 更新metadata
+        // 更新metadata（默认标记为分片文件）
         metadata.Channel = "TelegramNew";
         metadata.ChannelName = tgChannel.name;
         metadata.TgChatId = tgChatId;
@@ -590,21 +591,58 @@ async function mergeTelegramChunksInfo(context, uploadId, completedChunks, metad
         // 将分片信息存储到value中
         const chunksData = JSON.stringify(chunks);
         
-        // 写入数据库
+        // 写入数据库（分片记录）
         await db.put(finalFileId, chunksData, { metadata });
 
-        // 异步结束上传
+        // 异步结束上传（分片模式）
         waitUntil(endUpload(context, finalFileId, metadata));
 
-        // 生成返回链接
+        // 生成返回链接（供客户端和Telegram抓取）
+        const fullReturnLink = `${url.origin}/file/${finalFileId}`;
         const returnFormat = url.searchParams.get('returnFormat') || 'default';
         let updatedReturnLink = '';
         if (returnFormat === 'full') {
-            updatedReturnLink = `${url.origin}/file/${finalFileId}`;
+            updatedReturnLink = fullReturnLink;
         } else {
             updatedReturnLink = `/file/${finalFileId}`;
         }
 
+        // 可选：自动合并为单一Telegram文件（仅使用Telegram）
+        const autoMergeParam = url.searchParams.get('autoMerge') === 'true';
+        const autoMergeCfg = tgSettings.autoMerge || { enabled: false, useUrlFetch: true, maxSizeMB: 2048 };
+        const autoMergeEnabled = autoMergeParam || autoMergeCfg.enabled;
+
+        if (autoMergeEnabled) {
+            try {
+                // 通过URL让Telegram主动抓取整文件（避免Worker内存压力与Bot 20MB限制）
+                const tgApi = new TelegramAPI(tgBotToken);
+                const resp = await tgApi.sendFileByUrl(fullReturnLink, tgChatId, 'sendDocument', 'document', metadata.FileName);
+                const fileInfo = tgApi.getFileInfo(resp);
+
+                if (fileInfo && fileInfo.file_id) {
+                    // 更新metadata为非分片单文件
+                    const mergedMeta = { ...metadata };
+                    mergedMeta.IsChunked = false;
+                    mergedMeta.TgFileId = fileInfo.file_id;
+
+                    // 覆盖数据库记录：改为单文件元数据，清空value
+                    await db.put(finalFileId, "", { metadata: mergedMeta });
+
+                    // 异步结束上传（单文件模式，保留相同返回链接）
+                    waitUntil(endUpload(context, finalFileId, mergedMeta));
+
+                    return {
+                        success: true,
+                        result: [{ 'src': updatedReturnLink }]
+                    };
+                }
+            } catch (mergeErr) {
+                // 自动合并失败则保留分片模式
+                console.warn('Auto-merge to single Telegram file failed, keep chunked:', mergeErr.message);
+            }
+        }
+
+        // 如果未启用或失败，返回分片模式链接
         return {
             success: true,
             result: [{ 'src': updatedReturnLink }]
