@@ -126,6 +126,11 @@ export async function handleChunkUpload(context) {
         if (chunkData.byteLength > TELEGRAM_CHUNK_SIZE) {
             return createResponse(`Error: Chunk too large. Max ${TELEGRAM_CHUNK_SIZE} bytes`, { status: 400 });
         }
+        // 强制Telegram非最后一片为45MB，最后一片可小于45MB
+        const isLastChunk = chunkIndex === totalChunks - 1;
+        if (uploadChannel === 'telegram' && !isLastChunk && chunkData.byteLength !== TELEGRAM_CHUNK_SIZE) {
+            return createResponse(`Error: Invalid chunk size. Expected ${TELEGRAM_CHUNK_SIZE} bytes for non-final chunks`, { status: 400 });
+        }
         const uploadStartTime = Date.now();
         const initialChunkMetadata = {
             uploadId,
@@ -174,6 +179,24 @@ export async function handleCleanupRequest(context, uploadId, totalChunks) {
             }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
+        // 标记会话为已取消，阻止进行中的上传继续
+        const { env } = context;
+        const db = getDatabase(env);
+        const sessionKey = `upload_session_${uploadId}`;
+        try {
+            const sessionData = await db.get(sessionKey);
+            if (sessionData) {
+                const info = JSON.parse(sessionData);
+                info.status = 'cancelled';
+                info.cancelledAt = Date.now();
+                await db.put(sessionKey, JSON.stringify(info), { expirationTtl: 86400 });
+            } else {
+                await db.put(sessionKey, JSON.stringify({ uploadId, status: 'cancelled', cancelledAt: Date.now() }), { expirationTtl: 86400 });
+            }
+        } catch (e) {
+            console.warn('Failed to mark session cancelled:', e);
+        }
+
         // 强制清理所有相关数据
         await forceCleanupUpload(context, uploadId, totalChunks);
 
@@ -205,6 +228,21 @@ async function uploadChunkToStorageWithTimeout(context, chunkIndex, totalChunks,
     const UPLOAD_TIMEOUT = 900000; // 15分钟超时
 
     try {
+        // 如果已取消，直接标记并退出
+        const cancelled = await isUploadCancelled(env, uploadId);
+        if (cancelled) {
+            try {
+                const chunkRecord = await db.getWithMetadata(chunkKey, { type: 'arrayBuffer' });
+                if (chunkRecord && chunkRecord.metadata) {
+                    await db.put(chunkKey, chunkRecord.value, {
+                        metadata: { ...chunkRecord.metadata, status: 'cancelled', cancelledAt: Date.now() },
+                        expirationTtl: 86400
+                    });
+                }
+            } catch (_) {}
+            return;
+        }
+
         // 设置超时 Promise
         const timeoutPromise = new Promise((_, reject) => {
             setTimeout(() => reject(new Error('Upload timeout')), UPLOAD_TIMEOUT);
@@ -239,7 +277,7 @@ async function uploadChunkToStorageWithTimeout(context, chunkIndex, totalChunks,
                 });
             }
         } catch (metaError) {
-            console.error('Failed to save timeout/error metadata:', metaError);
+            console.error('Failed to save error metadata:', metaError);
         }
     }
 }
@@ -263,6 +301,22 @@ async function uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, 
 
         const chunkData = chunkRecord.value;
         const chunkMetadata = chunkRecord.metadata;
+
+        // 若已取消，标记并退出
+        const cancelled = await isUploadCancelled(env, uploadId);
+        if (cancelled) {
+            const cancelledMetadata = {
+                ...chunkMetadata,
+                status: 'cancelled',
+                cancelledAt: Date.now()
+            };
+            await db.put(chunkKey, chunkData, {
+                metadata: cancelledMetadata,
+                expirationTtl: 86400
+            });
+            console.log(`Chunk ${chunkIndex} skipped due to cancellation`);
+            return;
+        }
 
         for (let retry = 0; retry < MAX_RETRIES; retry++) {
             // 根据渠道上传分块
@@ -541,7 +595,13 @@ async function uploadSingleChunkToS3Multipart(context, chunkData, chunkIndex, to
 
 // 上传单个分块到Telegram
 async function uploadSingleChunkToTelegram(context, chunkData, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType) {
-    const { uploadConfig } = context;
+    const { env, uploadConfig } = context;
+    const db = getDatabase(env);
+    
+    // 如果已取消，直接返回
+    if (await isUploadCancelled(env, uploadId)) {
+        return { success: false, error: 'upload_cancelled' };
+    }
     
     try {
         const tgSettings = uploadConfig.telegram;
