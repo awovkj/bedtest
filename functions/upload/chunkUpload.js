@@ -122,6 +122,10 @@ export async function handleChunkUpload(context) {
         // 立即创建分块记录，标记为"uploading"状态
         const chunkKey = `chunk_${uploadId}_${chunkIndex.toString().padStart(3, '0')}`;
         const chunkData = await chunk.arrayBuffer();
+        // Enforce client chunk size limit to 45MB
+        if (chunkData.byteLength > TELEGRAM_CHUNK_SIZE) {
+            return createResponse(`Error: Chunk too large. Max ${TELEGRAM_CHUNK_SIZE} bytes`, { status: 400 });
+        }
         const uploadStartTime = Date.now();
         const initialChunkMetadata = {
             uploadId,
